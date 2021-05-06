@@ -90,3 +90,5 @@ clean:
 .PHONY: distclean
 distclean: clean
 
+pct.conf.5:
+	echo "fake" > $@
