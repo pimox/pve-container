@@ -9,14 +9,26 @@ use Fcntl qw(O_DIRECTORY :mode);
 use File::Path;
 use POSIX;
 
+use PVE::CGroup;
 use PVE::Cluster;
 use PVE::LXC::Config;
 use PVE::LXC::Setup;
 use PVE::LXC::Tools;
 use PVE::LXC;
+use PVE::SafeSyslog;
 use PVE::Storage;
 use PVE::Syscall qw(:fsmount);
 use PVE::Tools qw(AT_FDCWD O_PATH);
+
+my $WARNFD;
+sub log_warn {
+    my ($vmid, $message) = @_;
+
+    if (!defined($WARNFD)) {
+	open($WARNFD, '>', "/run/pve/ct-${vmid}.warnings");
+    }
+    print $WARNFD "$message\n";
+}
 
 PVE::LXC::Tools::lxc_hook('pre-start', 'lxc', sub {
     my ($vmid, $vars, undef, undef) = @_;
@@ -125,6 +137,14 @@ PVE::LXC::Tools::lxc_hook('pre-start', 'lxc', sub {
     my $lxc_setup = PVE::LXC::Setup->new($conf, $rootdir);
     $lxc_setup->pre_start_hook();
 
+    if (PVE::CGroup::cgroup_mode() == 2) {
+	if (!$lxc_setup->unified_cgroupv2_support()) {
+	    log_warn($vmid, "old systemd (< v232) detected, container won't run in a pure cgroupv2"
+		." environment! Please see documentation -> container -> cgroup version.");
+	    syslog('err', "CT $vmid does not support running in a pure cgroupv2 environment\n");
+	}
+    }
+
     if (@$devices) {
 	my $devlist = '';
 	foreach my $dev (@$devices) {
@@ -148,7 +168,7 @@ sub cleanup_cgroups($) {
 	rmdir_recursive("/sys/fs/cgroup/lxc/$vmid");
 	rmdir_recursive("/sys/fs/cgroup/lxc.monitor/$vmid");
     } else {
-	my ($v1, $v2) = PVE::LXC::get_cgroup_subsystems();
+	my ($v1, $v2) = PVE::CGroup::get_cgroup_controllers();
 
 	my @controllers_cgv1 = keys %$v1;
 	foreach my $controller (@controllers_cgv1) {

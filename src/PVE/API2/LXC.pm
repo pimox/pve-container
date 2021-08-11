@@ -247,6 +247,13 @@ __PACKAGE__->register_method({
 	    # we don't want to restore a container-provided FW conf in this case
 	    # since the user is lacking permission to configure the container's FW
 	    $skip_fw_config_restore = 1;
+
+	    # error out if a user tries to change from unprivileged to privileged
+	    # explicit change is checked here, implicit is checked down below or happening in root-only paths
+	    my $conf = PVE::LXC::Config->load_config($vmid);
+	    if ($conf->{unprivileged} && defined($unprivileged) && !$unprivileged) {
+		raise_perm_exc("cannot change from unprivileged to privileged without VM.Allocate");
+	    }
 	} else {
 	    raise_perm_exc();
 	}
@@ -254,7 +261,7 @@ __PACKAGE__->register_method({
 	my $ostemplate = extract_param($param, 'ostemplate');
 	my $storage = extract_param($param, 'storage') // 'local';
 
-	PVE::LXC::check_ct_modify_config_perm($rpcenv, $authuser, $vmid, $pool, $param, []);
+	PVE::LXC::check_ct_modify_config_perm($rpcenv, $authuser, $vmid, $pool, undef, $param, [], $unprivileged);
 
 	my $storage_cfg = cfs_read_file("storage.cfg");
 
@@ -275,7 +282,7 @@ __PACKAGE__->register_method({
 	my $check_and_activate_storage = sub {
 	    my ($sid) = @_;
 
-	    my $scfg = PVE::Storage::storage_check_node($storage_cfg, $sid, $node);
+	    my $scfg = PVE::Storage::storage_check_enabled($storage_cfg, $sid, $node);
 
 	    raise_param_exc({ storage => "storage '$sid' does not support container directories"})
 		if !$scfg->{content}->{rootdir};
@@ -343,11 +350,12 @@ __PACKAGE__->register_method({
 	eval { PVE::LXC::Config->create_and_lock_config($vmid, $force) };
 	die "$emsg $@" if $@;
 
+	my $remove_lock = 1;
+
 	my $code = sub {
 	    my $old_conf = PVE::LXC::Config->load_config($vmid);
 	    my $was_template;
 
-	    my $vollist = [];
 	    eval {
 		my $orig_mp_param; # only used if $restore
 		if ($restore) {
@@ -367,6 +375,11 @@ __PACKAGE__->register_method({
 
 			$conf->{unprivileged} = $orig_conf->{unprivileged}
 			    if !defined($unprivileged) && defined($orig_conf->{unprivileged});
+
+			# implicit privileged change is checked here
+			if ($old_conf->{unprivileged} && !$conf->{unprivileged}) {
+			    $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Allocate']);
+			}
 		    }
 		}
 		if ($storage_only_mode) {
@@ -409,7 +422,14 @@ __PACKAGE__->register_method({
 			$mp_param->{rootfs} = "$storage:4"; # defaults to 4GB
 		    }
 		}
+	    };
+	    die "$emsg $@" if $@;
 
+	    # up until here we did not modify the container, besides the lock
+	    $remove_lock = 0;
+
+	    my $vollist = [];
+	    eval {
 		$vollist = PVE::LXC::create_disks($storage_cfg, $vmid, $mp_param, $conf);
 
 		# we always have the 'create' lock so check for more than 1 entry
@@ -468,7 +488,18 @@ __PACKAGE__->register_method({
 	};
 
 	my $workername = $restore ? 'vzrestore' : 'vzcreate';
-	my $realcmd = sub { PVE::LXC::Config->lock_config($vmid, $code); };
+	my $realcmd = sub {
+	    eval {
+		PVE::LXC::Config->lock_config($vmid, $code);
+	    };
+	    if (my $err = $@) {
+		# if we aborted before changing the container, we must remove the create lock
+		if ($remove_lock) {
+		    PVE::LXC::Config->remove_lock($vmid, 'create');
+		}
+		die $err;
+	    }
+	};
 
 	return $rpcenv->fork_worker($workername, $vmid, $authuser, $realcmd);
     }});
@@ -1076,12 +1107,6 @@ __PACKAGE__->register_method({
 		optional => 1,
 		default => 180,
 	    },
-	    force => {
-		type => 'boolean',
-		description => "Force migration despite local bind / device" .
-		    " mounts. NOTE: deprecated, use 'shared' property of mount point instead.",
-		optional => 1,
-	    },
 	    bwlimit => {
 		description => "Override I/O bandwidth limit (in KiB/s).",
 		optional => 1,
@@ -1359,30 +1384,21 @@ __PACKAGE__->register_method({
 	my ($param) = @_;
 
 	my $rpcenv = PVE::RPCEnvironment::get();
-
-        my $authuser = $rpcenv->get_user();
+	my $authuser = $rpcenv->get_user();
 
 	my $node = extract_param($param, 'node');
-
 	my $vmid = extract_param($param, 'vmid');
-
 	my $newid = extract_param($param, 'newid');
-
 	my $pool = extract_param($param, 'pool');
-
 	if (defined($pool)) {
 	    $rpcenv->check_pool_exist($pool);
 	}
-
 	my $snapname = extract_param($param, 'snapname');
-
 	my $storage = extract_param($param, 'storage');
-
 	my $target = extract_param($param, 'target');
-
         my $localnode = PVE::INotify::nodename();
 
-        undef $target if $target && ($target eq $localnode || $target eq 'localhost');
+	undef $target if $target && ($target eq $localnode || $target eq 'localhost');
 
 	PVE::Cluster::check_node_exists($target) if $target;
 
@@ -1393,7 +1409,7 @@ __PACKAGE__->register_method({
 	    PVE::Storage::storage_check_enabled($storecfg, $storage);
 	    if ($target) {
 		# check if storage is available on target node
-		PVE::Storage::storage_check_node($storecfg, $storage, $target);
+		PVE::Storage::storage_check_enabled($storecfg, $storage, $target);
 		# clone only works if target storage is shared
 		my $scfg = PVE::Storage::storage_config($storecfg, $storage);
 		die "can't clone to non-shared storage '$storage'\n" if !$scfg->{shared};
@@ -1402,118 +1418,134 @@ __PACKAGE__->register_method({
 
 	PVE::Cluster::check_cfs_quorum();
 
-	my $conffile;
 	my $newconf = {};
 	my $mountpoints = {};
 	my $fullclone = {};
 	my $vollist = [];
 	my $running;
 
-	PVE::LXC::Config->lock_config($vmid, sub {
-	    my $src_conf = PVE::LXC::Config->set_lock($vmid, 'disk');
+	PVE::LXC::Config->create_and_lock_config($newid, 0);
+	PVE::Firewall::clone_vmfw_conf($vmid, $newid);
 
-	    $running = PVE::LXC::check_running($vmid) || 0;
+	my $lock_and_reload = sub {
+	    my ($vmid, $code) = @_;
+	    return PVE::LXC::Config->lock_config($vmid, sub {
+		my $conf = PVE::LXC::Config->load_config($vmid);
+		die "Lost 'create' config lock, aborting.\n"
+		    if !PVE::LXC::Config->has_lock($conf, 'create');
 
-	    my $full = extract_param($param, 'full');
-	    if (!defined($full)) {
-		$full = !PVE::LXC::Config->is_template($src_conf);
+		return $code->($conf);
+	    });
+	};
+
+	my $src_conf = PVE::LXC::Config->set_lock($vmid, 'disk');
+
+	$running = PVE::LXC::check_running($vmid) || 0;
+
+	my $full = extract_param($param, 'full');
+	if (!defined($full)) {
+	    $full = !PVE::LXC::Config->is_template($src_conf);
+	}
+
+	eval {
+	    die "parameter 'storage' not allowed for linked clones\n"
+		if defined($storage) && !$full;
+
+	    die "snapshot '$snapname' does not exist\n"
+		if $snapname && !defined($src_conf->{snapshots}->{$snapname});
+
+	    my $src_conf = $snapname ? $src_conf->{snapshots}->{$snapname} : $src_conf;
+
+	    my $sharedvm = 1;
+	    for my $opt (sort keys %$src_conf) {
+		next if $opt =~ m/^unused\d+$/;
+
+		my $value = $src_conf->{$opt};
+
+		if (($opt eq 'rootfs') || ($opt =~ m/^mp\d+$/)) {
+		    my $mp = PVE::LXC::Config->parse_volume($opt, $value);
+
+		    if ($mp->{type} eq 'volume') {
+			my $volid = $mp->{volume};
+
+			my ($sid, $volname) = PVE::Storage::parse_volume_id($volid);
+			$sid = $storage if defined($storage);
+			my $scfg = PVE::Storage::storage_config($storecfg, $sid);
+			if (!$scfg->{shared}) {
+			    $sharedvm = 0;
+			    warn "found non-shared volume: $volid\n" if $target;
+			}
+
+			$rpcenv->check($authuser, "/storage/$sid", ['Datastore.AllocateSpace']);
+
+			if ($full) {
+			    die "Cannot do full clones on a running container without snapshots\n"
+				if $running && !defined($snapname);
+			    $fullclone->{$opt} = 1;
+			} else {
+			    # not full means clone instead of copy
+			    die "Linked clone feature for '$volid' is not available\n"
+				if !PVE::Storage::volume_has_feature($storecfg, 'clone', $volid, $snapname, $running, {'valid_target_formats' => ['raw', 'subvol']});
+			}
+
+			$mountpoints->{$opt} = $mp;
+			push @$vollist, $volid;
+
+		    } else {
+			# TODO: allow bind mounts?
+			die "unable to clone mountpoint '$opt' (type $mp->{type})\n";
+		    }
+		} elsif ($opt =~ m/^net(\d+)$/) {
+		    # always change MAC! address
+		    my $dc = PVE::Cluster::cfs_read_file('datacenter.cfg');
+		    my $net = PVE::LXC::Config->parse_lxc_network($value);
+		    $net->{hwaddr} = PVE::Tools::random_ether_addr($dc->{mac_prefix});
+		    $newconf->{$opt} = PVE::LXC::Config->print_lxc_network($net);
+		} else {
+		    # copy everything else
+		    $newconf->{$opt} = $value;
+		}
 	    }
-	    die "parameter 'storage' not allowed for linked clones\n" if defined($storage) && !$full;
+	    die "can't clone CT to node '$target' (CT uses local storage)\n"
+		if $target && !$sharedvm;
+
+	    # Replace the 'disk' lock with a 'create' lock.
+	    $newconf->{lock} = 'create';
+
+	    delete $newconf->{snapshots};
+	    delete $newconf->{pending};
+	    delete $newconf->{template};
+	    if ($param->{hostname}) {
+		$newconf->{hostname} = $param->{hostname};
+	    }
+
+	    if ($param->{description}) {
+		$newconf->{description} = $param->{description};
+	    }
+
+	    $lock_and_reload->($newid, sub {
+		PVE::LXC::Config->write_config($newid, $newconf);
+	    });
+	};
+	if (my $err = $@) {
+	    eval { PVE::LXC::Config->remove_lock($vmid, 'disk') };
+	    warn "Failed to remove source CT config lock - $@\n" if $@;
 
 	    eval {
-		die "snapshot '$snapname' does not exist\n"
-		    if $snapname && !defined($src_conf->{snapshots}->{$snapname});
-
-
-		my $src_conf = $snapname ? $src_conf->{snapshots}->{$snapname} : $src_conf;
-
-		$conffile = PVE::LXC::Config->config_file($newid);
-		die "unable to create CT $newid: config file already exists\n"
-		    if -f $conffile;
-
-		my $sharedvm = 1;
-		foreach my $opt (keys %$src_conf) {
-		    next if $opt =~ m/^unused\d+$/;
-
-		    my $value = $src_conf->{$opt};
-
-		    if (($opt eq 'rootfs') || ($opt =~ m/^mp\d+$/)) {
-			my $mp = PVE::LXC::Config->parse_volume($opt, $value);
-
-			if ($mp->{type} eq 'volume') {
-			    my $volid = $mp->{volume};
-
-			    my ($sid, $volname) = PVE::Storage::parse_volume_id($volid);
-			    $sid = $storage if defined($storage);
-			    my $scfg = PVE::Storage::storage_config($storecfg, $sid);
-			    if (!$scfg->{shared}) {
-				$sharedvm = 0;
-				warn "found non-shared volume: $volid\n" if $target;
-			    }
-
-			    $rpcenv->check($authuser, "/storage/$sid", ['Datastore.AllocateSpace']);
-
-			    if ($full) {
-				die "Cannot do full clones on a running container without snapshots\n"
-				    if $running && !defined($snapname);
-				$fullclone->{$opt} = 1;
-			    } else {
-				# not full means clone instead of copy
-				die "Linked clone feature for '$volid' is not available\n"
-				    if !PVE::Storage::volume_has_feature($storecfg, 'clone', $volid, $snapname, $running, {'valid_target_formats' => ['raw', 'subvol']});
-			    }
-
-			    $mountpoints->{$opt} = $mp;
-			    push @$vollist, $volid;
-
-			} else {
-			    # TODO: allow bind mounts?
-			    die "unable to clone mountpint '$opt' (type $mp->{type})\n";
-			}
-		    } elsif ($opt =~ m/^net(\d+)$/) {
-			# always change MAC! address
-			my $dc = PVE::Cluster::cfs_read_file('datacenter.cfg');
-			my $net = PVE::LXC::Config->parse_lxc_network($value);
-			$net->{hwaddr} = PVE::Tools::random_ether_addr($dc->{mac_prefix});
-			$newconf->{$opt} = PVE::LXC::Config->print_lxc_network($net);
-		    } else {
-			# copy everything else
-			$newconf->{$opt} = $value;
-		    }
-		}
-		die "can't clone CT to node '$target' (CT uses local storage)\n"
-		    if $target && !$sharedvm;
-
-		# Replace the 'disk' lock with a 'create' lock.
-		$newconf->{lock} = 'create';
-
-		delete $newconf->{snapshots};
-		delete $newconf->{pending};
-		delete $newconf->{template};
-		if ($param->{hostname}) {
-		    $newconf->{hostname} = $param->{hostname};
-		}
-
-		if ($param->{description}) {
-		    $newconf->{description} = $param->{description};
-		}
-
-		# create empty/temp config - this fails if CT already exists on other node
-		PVE::LXC::Config->write_config($newid, $newconf);
+		$lock_and_reload->($newid, sub {
+		    PVE::LXC::Config->destroy_config($newid);
+		    PVE::Firewall::remove_vmfw_conf($newid);
+		});
 	    };
-	    if (my $err = $@) {
-		eval { PVE::LXC::Config->remove_lock($vmid, 'disk') };
-		warn $@ if $@;
-		die $err;
-	    }
-	});
+	    warn "Failed to remove target CT config - $@\n" if $@;
+
+	    die $err;
+	}
 
 	my $update_conf = sub {
 	    my ($key, $value) = @_;
-	    return PVE::LXC::Config->lock_config($newid, sub {
-		my $conf = PVE::LXC::Config->load_config($newid);
-		die "Lost 'create' config lock, aborting.\n"
-		    if !PVE::LXC::Config->has_lock($conf, 'create');
+	    return $lock_and_reload->($newid, sub {
+		my $conf = shift;
 		$conf->{$key} = $value;
 		PVE::LXC::Config->write_config($newid, $conf);
 	    });
@@ -1559,6 +1591,50 @@ __PACKAGE__->register_method({
 		}
 
 		PVE::AccessControl::add_vm_to_pool($newid, $pool) if $pool;
+
+		$lock_and_reload->($newid, sub {
+		    my $conf = shift;
+		    my $rootdir = PVE::LXC::mount_all($newid, $storecfg, $conf, 1);
+		    eval {
+			my $lxc_setup = PVE::LXC::Setup->new($conf, $rootdir);
+			$lxc_setup->post_clone_hook($conf);
+		    };
+		    my $err = $@;
+		    eval { PVE::LXC::umount_all($newid, $storecfg, $conf, 1); };
+		    if ($err) {
+			warn "$@\n" if $@;
+			die $err;
+		    } else {
+			die $@ if $@;
+		    }
+		});
+	    };
+	    my $err = $@;
+	    # Unlock the source config in any case:
+	    eval { PVE::LXC::Config->remove_lock($vmid, 'disk') };
+	    warn $@ if $@;
+
+	    if ($err) {
+		# Now cleanup the config & disks:
+		sleep 1; # some storages like rbd need to wait before release volume - really?
+
+		foreach my $volid (@$newvollist) {
+		    eval { PVE::Storage::vdisk_free($storecfg, $volid); };
+		    warn $@ if $@;
+		}
+
+		eval {
+		    $lock_and_reload->($newid, sub {
+			PVE::LXC::Config->destroy_config($newid);
+			PVE::Firewall::remove_vmfw_conf($newid);
+		    });
+		};
+		warn "Failed to remove target CT config - $@\n" if $@;
+
+		die "clone failed: $err";
+	    }
+
+	    $lock_and_reload->($newid, sub {
 		PVE::LXC::Config->remove_lock($newid, 'create');
 
 		if ($target) {
@@ -1566,34 +1642,13 @@ __PACKAGE__->register_method({
 		    PVE::Storage::deactivate_volumes($storecfg, $vollist, $snapname) if !$running;
 		    PVE::Storage::deactivate_volumes($storecfg, $newvollist);
 
-		    my $newconffile = PVE::LXC::Config->config_file($newid, $target);
-		    die "Failed to move config to node '$target' - rename failed: $!\n"
-			if !rename($conffile, $newconffile);
+		    PVE::LXC::Config->move_config_to_node($newid, $target);
 		}
-	    };
-	    my $err = $@;
-
-	    # Unlock the source config in any case:
-	    eval { PVE::LXC::Config->remove_lock($vmid, 'disk') };
-	    warn $@ if $@;
-
-	    if ($err) {
-		# Now cleanup the config & disks:
-		unlink $conffile;
-
-		sleep 1; # some storages like rbd need to wait before release volume - really?
-
-		foreach my $volid (@$newvollist) {
-		    eval { PVE::Storage::vdisk_free($storecfg, $volid); };
-		    warn $@ if $@;
-		}
-		die "clone failed: $err";
-	    }
+	    });
 
 	    return;
 	};
 
-	PVE::Firewall::clone_vmfw_conf($vmid, $newid);
 	return $rpcenv->fork_worker('vzclone', $vmid, $authuser, $realcmd);
     }});
 
@@ -1655,14 +1710,14 @@ __PACKAGE__->register_method({
 
 	die "no options specified\n" if !scalar(keys %$param);
 
-	PVE::LXC::check_ct_modify_config_perm($rpcenv, $authuser, $vmid, undef, $param, []);
-
 	my $storage_cfg = cfs_read_file("storage.cfg");
 
 	my $code = sub {
 
 	    my $conf = PVE::LXC::Config->load_config($vmid);
 	    PVE::LXC::Config->check_lock($conf);
+
+	    PVE::LXC::check_ct_modify_config_perm($rpcenv, $authuser, $vmid, undef, $conf, $param, [], $conf->{unprivileged});
 
 	    PVE::Tools::assert_if_modified($digest, $conf->{digest});
 

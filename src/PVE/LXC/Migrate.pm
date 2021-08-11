@@ -44,20 +44,14 @@ sub prepare {
     }
     $self->{was_running} = $running;
 
-    my $force = $self->{opts}->{force} // 0;
-
-    PVE::LXC::Config->foreach_volume($conf, sub {
+    PVE::LXC::Config->foreach_volume_full($conf, { include_unused => 1 }, sub {
 	my ($ms, $mountpoint) = @_;
 
 	my $volid = $mountpoint->{volume};
 	my $type = $mountpoint->{type};
 
-	# skip dev/bind mps when forced / shared
+	# skip dev/bind mps when shared
 	if ($type ne 'volume') {
-	    if ($force) {
-		warn "-force is deprecated, please use the 'shared' property on individual non-volume mount points instead!\n";
-		return;
-	    }
 	    if ($mountpoint->{shared}) {
 		return;
 	    } else {
@@ -69,9 +63,11 @@ sub prepare {
 	die "can't determine assigned storage for mount point '$ms'\n" if !$storage;
 
 	# check if storage is available on both nodes
-	my $scfg = PVE::Storage::storage_check_node($self->{storecfg}, $storage);
-	PVE::Storage::storage_check_node($self->{storecfg}, $storage, $self->{node});
+	my $scfg = PVE::Storage::storage_check_enabled($self->{storecfg}, $storage);
+	PVE::Storage::storage_check_enabled($self->{storecfg}, $storage, $self->{node});
 
+	die "content type 'rootdir' is not available on storage '$storage'\n"
+	    if !$scfg->{content}->{rootdir};
 
 	if ($scfg->{shared}) {
 	    # PVE::Storage::activate_storage checks this for non-shared storages
@@ -140,8 +136,8 @@ sub phase1 {
 	my ($sid, $volname) = PVE::Storage::parse_volume_id($volid);
 
 	# check if storage is available on both nodes
-	my $scfg = PVE::Storage::storage_check_node($self->{storecfg}, $sid);
-	PVE::Storage::storage_check_node($self->{storecfg}, $sid, $self->{node});
+	my $scfg = PVE::Storage::storage_check_enabled($self->{storecfg}, $sid);
+	PVE::Storage::storage_check_enabled($self->{storecfg}, $sid, $self->{node});
 
 	if ($scfg->{shared}) {
 	    $self->log('info', "volume '$volid' is on shared storage '$sid'")
@@ -150,7 +146,7 @@ sub phase1 {
 	}
 
 	$volhash->{$volid}->{ref} = defined($snapname) ? 'snapshot' : 'config';
-	$volhash->{$volid}->{snapshots} = defined($snapname);
+	$volhash->{$volid}->{snapshots} = 1 if defined($snapname);
 
 	my ($path, $owner) = PVE::Storage::path($self->{storecfg}, $volid);
 
@@ -159,8 +155,8 @@ sub phase1 {
 
 	if (defined($snapname)) {
 	    # we cannot migrate shapshots on local storage
-	    # exceptions: 'zfspool'
-	    if (($scfg->{type} eq 'zfspool')) {
+	    # exceptions: 'zfspool', 'btrfs'
+	    if ($scfg->{type} eq 'zfspool' || $scfg->{type} eq 'btrfs') {
 		return;
 	    }
 	    die "non-migratable snapshot exists\n";
@@ -192,13 +188,16 @@ sub phase1 {
 	next if $scfg->{shared};
 	next if !PVE::Storage::storage_check_enabled($self->{storecfg}, $storeid, undef, 1);
 
-	# get list from PVE::Storage (for unused volumes)
-	my $dl = PVE::Storage::vdisk_list($self->{storecfg}, $storeid, $vmid);
+	# get list from PVE::Storage (for unreferenced volumes)
+	my $dl = PVE::Storage::vdisk_list($self->{storecfg}, $storeid, $vmid, undef, 'rootdir');
 
 	next if @{$dl->{$storeid}} == 0;
 
 	# check if storage is available on target node
-	PVE::Storage::storage_check_node($self->{storecfg}, $storeid, $self->{node});
+	PVE::Storage::storage_check_enabled($self->{storecfg}, $storeid, $self->{node});
+
+	die "content type 'rootdir' is not available on storage '$storeid'\n"
+	    if !$scfg->{content}->{rootdir};
 
 	PVE::Storage::foreach_volid($dl, sub {
 	    my ($volid, $sid, $volname) = @_;
@@ -214,9 +213,8 @@ sub phase1 {
 	PVE::LXC::Config->foreach_volume($conf->{snapshots}->{$snapname}, $test_mp, $snapname);
     }
 
-    # finally all currently used volumes
-    PVE::LXC::Config->foreach_volume($conf, $test_mp);
-
+    # finally all current volumes
+    PVE::LXC::Config->foreach_volume_full($conf, { include_unused => 1 }, $test_mp);
 
     # additional checks for local storage
     foreach my $volid (keys %$volhash) {
@@ -224,8 +222,9 @@ sub phase1 {
 	    my ($sid, $volname) = PVE::Storage::parse_volume_id($volid);
 	    my $scfg =  PVE::Storage::storage_config($self->{storecfg}, $sid);
 
-	    my $migratable = ($scfg->{type} eq 'dir') || ($scfg->{type} eq 'zfspool') ||
-		($scfg->{type} eq 'lvmthin') || ($scfg->{type} eq 'lvm');
+	    my $migratable = ($scfg->{type} eq 'dir') || ($scfg->{type} eq 'zfspool')
+		|| ($scfg->{type} eq 'lvmthin') || ($scfg->{type} eq 'lvm')
+		|| ($scfg->{type} eq 'btrfs');
 
 	    die "storage type '$scfg->{type}' not supported\n"
 		if !$migratable;

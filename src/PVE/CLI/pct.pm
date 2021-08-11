@@ -3,24 +3,25 @@ package PVE::CLI::pct;
 use strict;
 use warnings;
 
-use POSIX;
 use Fcntl;
 use File::Copy 'copy';
+use POSIX;
 
+use PVE::CLIHandler;
+use PVE::Cluster;
+use PVE::CpuSet;
 use PVE::GuestHelpers;
+use PVE::INotify;
+use PVE::JSONSchema qw(get_standard_option);
+use PVE::LXC::CGroup;
+use PVE::RPCEnvironment;
 use PVE::SafeSyslog;
 use PVE::Tools qw(extract_param);
-use PVE::CpuSet;
-use PVE::Cluster;
-use PVE::INotify;
-use PVE::RPCEnvironment;
-use PVE::JSONSchema qw(get_standard_option);
-use PVE::CLIHandler;
-use PVE::API2::LXC;
+
 use PVE::API2::LXC::Config;
-use PVE::API2::LXC::Status;
 use PVE::API2::LXC::Snapshot;
-use PVE::LXC::CGroup;
+use PVE::API2::LXC::Status;
+use PVE::API2::LXC;
 
 use base qw(PVE::CLIHandler);
 
@@ -29,7 +30,7 @@ my $nodename = PVE::INotify::nodename();
 my $upid_exit = sub {
     my $upid = shift;
     my $status = PVE::Tools::upid_read_status($upid);
-    exit($status eq 'OK' ? 0 : -1);
+    exit(PVE::Tools::upid_status_is_error($status) ? -1 : 0);
 };
 
 sub setup_environment {
@@ -116,7 +117,7 @@ __PACKAGE__->register_method ({
     method => 'GET',
     description => "Launch a console for the specified container.",
     parameters => {
-    	additionalProperties => 0,
+	additionalProperties => 0,
 	properties => {
 	    vmid => get_standard_option('pve-vmid', { completion => \&PVE::LXC::complete_ctid_running }),
 	    escape => {
@@ -146,7 +147,7 @@ __PACKAGE__->register_method ({
     method => 'GET',
     description => "Launch a shell for the specified container.",
     parameters => {
-    	additionalProperties => 0,
+	additionalProperties => 0,
 	properties => {
 	    vmid => get_standard_option('pve-vmid', { completion => \&PVE::LXC::complete_ctid_running }),
 	},
@@ -158,10 +159,8 @@ __PACKAGE__->register_method ({
 
 	my $vmid = $param->{vmid};
 
-	# test if container exists on this node
-	PVE::LXC::Config->load_config($vmid);
-
-	die "Error: container '$vmid' not running!\n" if !PVE::LXC::check_running($vmid);
+	PVE::LXC::Config->load_config($vmid); # test if container exists on this node
+	die "container '$vmid' not running!\n" if !PVE::LXC::check_running($vmid);
 
 	exec('lxc-attach', '-n',  $vmid);
     }});
@@ -172,24 +171,23 @@ __PACKAGE__->register_method ({
     method => 'GET',
     description => "Launch a command inside the specified container.",
     parameters => {
-    	additionalProperties => 0,
+	additionalProperties => 0,
 	properties => {
 	    vmid => get_standard_option('pve-vmid', { completion => \&PVE::LXC::complete_ctid_running }),
 	    'extra-args' => get_standard_option('extra-args'),
 	},
     },
     returns => { type => 'null' },
-
     code => sub {
 	my ($param) = @_;
 
-	# test if container exists on this node
-	PVE::LXC::Config->load_config($param->{vmid});
+	my $vmid = $param->{vmid};
+	PVE::LXC::Config->load_config($vmid); # test if container exists on this node
+	die "container '$vmid' not running!\n" if !PVE::LXC::check_running($vmid);
 
-	if (!@{$param->{'extra-args'}}) {
-	    die "missing command";
-	}
-	exec('lxc-attach', '-n', $param->{vmid}, '--', @{$param->{'extra-args'}});
+	die "missing command" if !@{$param->{'extra-args'}};
+
+	exec('lxc-attach', '-n', $vmid, '--', @{$param->{'extra-args'}});
     }});
 
 __PACKAGE__->register_method ({
@@ -217,8 +215,8 @@ __PACKAGE__->register_method ({
     },
     returns => { type => 'null' },
     code => sub {
-
 	my ($param) = @_;
+
 	my $vmid = $param->{'vmid'};
 	my $device = defined($param->{'device'}) ? $param->{'device'} : 'rootfs';
 
@@ -713,10 +711,10 @@ __PACKAGE__->register_method ({
 	    my $cgroup = PVE::LXC::CGroup->new($vmid);
 
 	    my ($cpuset, $path);
-	    if (defined($path = $cgroup->get_path('cpuset'))) {
-		$cpuset = eval { PVE::CpuSet->new_from_path($path); };
-	    } elsif (defined($path = $cgroup->get_path())) {
-		$cpuset = eval { PVE::CpuSet->new_from_path($path); };
+	    if (defined($path = $cgroup->get_path('cpuset', 1))) {
+		$cpuset = eval { PVE::CpuSet->new_from_path($path, 1); };
+	    } elsif (defined($path = $cgroup->get_path(undef, 1))) {
+		$cpuset = eval { PVE::CpuSet->new_from_path($path, 1); };
 	    } else {
 		# Container not running.
 		next;
@@ -816,25 +814,22 @@ our $cmddef = {
 	    printf($format, $d->{vmid}, $d->{status}, $lock, $d->{name});
 	}
     }],
-    config => [ "PVE::API2::LXC::Config", 'vm_config', ['vmid'], 
-		{ node => $nodename }, sub {
-		    my $config = shift;
-		    foreach my $k (sort (keys %$config)) {
-			next if $k eq 'digest';
-			next if $k eq 'lxc';
-			my $v = $config->{$k};
-			if ($k eq 'description') {
-			    $v = PVE::Tools::encode_text($v);
-			}
-			print "$k: $v\n";
-		    }
-		    if (defined($config->{'lxc'})) {
-			my $lxc_list = $config->{'lxc'};
-			foreach my $lxc_opt (@$lxc_list) {
-			    print "$lxc_opt->[0]: $lxc_opt->[1]\n"
-			}
-		    }
-		}],
+    config => [ "PVE::API2::LXC::Config", 'vm_config', ['vmid'], { node => $nodename }, sub {
+	my $config = shift;
+	for my $k (sort (keys %$config)) {
+	    next if $k eq 'digest' || $k eq 'lxc';
+	    my $v = $config->{$k};
+	    if ($k eq 'description') {
+		$v = PVE::Tools::encode_text($v);
+	    }
+	    print "$k: $v\n";
+	}
+	if (defined(my $lxc_list = $config->{'lxc'})) {
+	    for my $lxc_opt (@$lxc_list) {
+		print "$lxc_opt->[0]: $lxc_opt->[1]\n"
+	    }
+	}
+    }],
 
     pending => [ "PVE::API2::LXC", "vm_pending", ['vmid'], { node => $nodename }, \&PVE::GuestHelpers::format_pending ],
     set => [ 'PVE::API2::LXC::Config', 'update_vm', ['vmid'], { node => $nodename }],
@@ -879,6 +874,5 @@ our $cmddef = {
     cpusets => [ __PACKAGE__, 'cpusets', []],
     fstrim => [ __PACKAGE__, 'fstrim', ['vmid']],
 };
-
 
 1;

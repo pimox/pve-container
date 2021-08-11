@@ -476,6 +476,69 @@ sub set_timezone {
     }
 }
 
+sub clear_machine_id {
+    my ($self, $conf, $clone) = @_;
+
+    my $uses_systemd = $self->ct_is_executable("/lib/systemd/systemd")
+	|| $self->ct_is_executable("/usr/lib/systemd/systemd");
+
+    my $dbus_machine_id_path = "/var/lib/dbus/machine-id";
+    my $machine_id_path = "/etc/machine-id";
+
+    my $machine_id_existed = $self->ct_file_exists($machine_id_path);
+
+    if (
+	$self->ct_file_exists($dbus_machine_id_path)
+	&& !$self->ct_is_symlink($dbus_machine_id_path)
+	&& $uses_systemd
+    ) {
+        $self->ct_unlink($dbus_machine_id_path);
+    }
+
+    # truncate on clone to avoid that FirstBoot condition is set
+    if ($clone && ($uses_systemd || $machine_id_existed)) {
+	$self->ct_file_set_contents($machine_id_path, "\n");
+    } elsif (!$clone && $machine_id_existed) {
+	$self->ct_unlink($machine_id_path);
+    }
+}
+
+# tries to guess the systemd version based on the existence of
+# (/usr)?/lib/systemd/libsystemd-shared<version>.so. It was introduced in v231.
+sub get_systemd_version {
+    my ($self) = @_;
+
+    my $sd_lib_dir = $self->ct_is_directory("/lib/systemd") ?
+	"/lib/systemd" : "/usr/lib/systemd";
+    my $libsd = PVE::Tools::dir_glob_regex($sd_lib_dir, "libsystemd-shared-.+\.so");
+    if (defined($libsd) && $libsd =~ /libsystemd-shared-(\d+)\.so/) {
+	return $1;
+    }
+
+    return undef;
+}
+
+sub unified_cgroupv2_support {
+    my ($self) = @_;
+
+    # https://www.freedesktop.org/software/systemd/man/systemd.html
+    # systemd is installed as symlink to /sbin/init
+    my $systemd = $self->ct_readlink('/sbin/init');
+
+    # assume non-systemd init will run with unified cgroupv2
+    if (!defined($systemd) || $systemd !~ m@/systemd$@) {
+	return 1;
+    }
+
+    # systemd version 232 (e.g. debian stretch) supports the unified hierarchy
+    my $sdver = $self->get_systemd_version();
+    if (!defined($sdver) || $sdver < 232) {
+	return 0;
+    }
+
+    return 1
+}
+
 sub pre_start_hook {
     my ($self, $conf) = @_;
 
@@ -488,9 +551,16 @@ sub pre_start_hook {
     # fixme: what else ?
 }
 
+sub post_clone_hook {
+    my ($self, $conf) = @_;
+
+    $self->clear_machine_id($conf, 1);
+}
+
 sub post_create_hook {
     my ($self, $conf, $root_password, $ssh_keys) = @_;
 
+    $self->clear_machine_id($conf);
     $self->template_fixup($conf);
 
     &$randomize_crontab($self, $conf);

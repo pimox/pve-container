@@ -52,10 +52,16 @@ sub detect_architecture {
 	return $arch;
     };
 
-    my $arch = eval { PVE::Tools::run_fork_with_timeout(5, $detect_arch) };
-    if (my $err = $@) {
+    my $arch = eval { PVE::Tools::run_fork_with_timeout(10, $detect_arch); };
+    my $err = $@;
+
+    if (!defined($arch) && !defined($err)) {
+	# on timeout
+	die "Architecture detection failed: timeout\n";
+    } elsif ($err) {
+	# any other error
 	$arch = 'amd64';
-	print "Architecture detection failed: $err\nFalling back to amd64.\n" .
+	print "Architecture detection failed: $err\nFalling back to $arch.\n" .
 	      "Use `pct set VMID --arch ARCH` to change.\n";
     } else {
 	print "Detected container architecture: $arch\n";
@@ -313,6 +319,11 @@ sub sanitize_and_merge_config {
 	# we know if it was a template in the restore API call and check if the target
 	# storage supports creating a template there
 	next if $key =~ /^template$/;
+
+	if ($restricted && $key eq 'features' && !$conf->{unprivileged} && $oldconf->{unprivileged}) {
+	    warn "changing from unprivileged to privileged, skipping features\n";
+	    next;
+	}
 
 	if ($key eq 'lxc' && $restricted) {
 	    my $lxc_list = $oldconf->{'lxc'};

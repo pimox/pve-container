@@ -29,6 +29,7 @@ use PVE::Tools qw(
     $IPV4RE
     $IPV6RE
 );
+use PVE::RPCEnvironment;
 use PVE::CpuSet;
 use PVE::Network;
 use PVE::AccessControl;
@@ -53,6 +54,8 @@ my $LXC_CONFIG_PATH = '/usr/share/lxc/config';
 my $nodename = PVE::INotify::nodename();
 
 my $cpuinfo= PVE::ProcFSTools::read_cpuinfo();
+
+our $NEW_DISK_RE = qr/^([^:\s]+):(\d+(\.\d+)?)$/;
 
 sub config_list {
     my $vmlist = PVE::Cluster::get_vmlist();
@@ -171,7 +174,7 @@ our $vmstatus_return_properties = {
 sub vmstatus {
     my ($opt_vmid) = @_;
 
-    my $list = $opt_vmid ? { $opt_vmid => { type => 'lxc', vmid => $opt_vmid }} : config_list();
+    my $list = $opt_vmid ? { $opt_vmid => { type => 'lxc', vmid => int($opt_vmid) }} : config_list();
 
     my $active_hash = list_active_containers();
 
@@ -187,7 +190,7 @@ sub vmstatus {
     foreach my $vmid (keys %$list) {
 	my $d = $list->{$vmid};
 
-	eval { $d->{pid} = find_lxc_pid($vmid) if defined($active_hash->{$vmid}); };
+	eval { $d->{pid} = int(find_lxc_pid($vmid)) if defined($active_hash->{$vmid}); };
 	warn $@ if $@; # ignore errors (consider them stopped)
 
 	$d->{status} = $active_hash->{$vmid} ? 'running' : 'stopped';
@@ -207,8 +210,8 @@ sub vmstatus {
 
 	if ($d->{pid}) {
 	    my $res = get_container_disk_usage($vmid, $d->{pid});
-	    $d->{disk} = $res->{used};
-	    $d->{maxdisk} = $res->{total};
+	    $d->{disk} = int($res->{used});
+	    $d->{maxdisk} = int($res->{total});
 	} else {
 	    $d->{disk} = 0;
 	    # use 4GB by default ??
@@ -234,7 +237,7 @@ sub vmstatus {
 	$d->{diskread} = 0;
 	$d->{diskwrite} = 0;
 
-	$d->{template} = PVE::LXC::Config->is_template($conf);
+	$d->{template} = 1 if PVE::LXC::Config->is_template($conf);
 	$d->{lock} = $conf->{lock} if $conf->{lock};
     }
 
@@ -252,16 +255,16 @@ sub vmstatus {
 	my $cgroups = PVE::LXC::CGroup->new($vmid);
 
 	if (defined(my $mem = $cgroups->get_memory_stat())) {
-	    $d->{mem} = $mem->{mem};
-	    $d->{swap} = $mem->{swap};
+	    $d->{mem} = int($mem->{mem});
+	    $d->{swap} = int($mem->{swap});
 	} else {
 	    $d->{mem} = 0;
 	    $d->{swap} = 0;
 	}
 
 	if (defined(my $blkio = $cgroups->get_io_stats())) {
-	    $d->{diskread} = $blkio->{diskread};
-	    $d->{diskwrite} = $blkio->{diskwrite};
+	    $d->{diskread} = int($blkio->{diskread});
+	    $d->{diskwrite} = int($blkio->{diskwrite});
 	} else {
 	    $d->{diskread} = 0;
 	    $d->{diskwrite} = 0;
@@ -408,11 +411,6 @@ sub parse_ipv4_cidr {
     die "unable to parse ipv4 address/mask\n";
 }
 
-# Deprecated. Use `PVE::CGroup::get_cgroup_controllers()` instead.
-sub get_cgroup_subsystems {
-    PVE::CGroup::get_v1_controllers();
-}
-
 # With seccomp trap to userspace we now have the ability to optionally forward
 # certain syscalls to the "host" to handle (via our pve-lxc-syscalld daemon).
 #
@@ -440,6 +438,15 @@ sub make_seccomp_config {
 
     my $rules = {
 	keyctl => ['errno 38'],
+
+	# Disable btrfs ioctrls since they don't work particularly well in user namespaces.
+	# Particularly, without the mount option to enable rmdir removing snapshots, user
+	# namespaces can create snapshots but neither `show` or `delete` them, which is quite
+	# horrible, so for now, just disable this entirely:
+	#
+	# BTRFS_IOCTL_MAGIC 0x94, _IOC type shift is 8,
+	# so `(req & 0xFF00) == 0x9400` is a btrfs ioctl and gets an EPERM
+	ioctl  => ['errno 1 [1,0x9400,SCMP_CMP_MASKED_EQ,0xff00]'],
     };
 
     my $raw_conf = '';
@@ -605,6 +612,8 @@ sub update_lxc_config {
 
     my $ostype = $conf->{ostype} || die "missing 'ostype' - internal error";
 
+    File::Path::mkpath($dir);
+
     my $cfgpath = '/usr/share/lxc/config';
     my $inc = "$cfgpath/$ostype.common.conf";
     $inc ="$cfgpath/common.conf" if !-f $inc;
@@ -637,7 +646,7 @@ sub update_lxc_config {
     # files while the container is running!
     $raw .= "lxc.monitor.unshare = 1\n";
 
-    my $cgv1 = get_cgroup_subsystems();
+    my ($cgv1, $cgv2) = PVE::CGroup::get_cgroup_controllers();
 
     # Should we read them from /etc/subuid?
     if ($unprivileged && !$custom_idmap) {
@@ -647,7 +656,11 @@ sub update_lxc_config {
 
     if (!PVE::LXC::Config->has_dev_console($conf)) {
 	$raw .= "lxc.console.path = none\n";
-	$raw .= "lxc.cgroup.devices.deny = c 5:1 rwm\n" if $cgv1->{devices};
+	if ($cgv1->{devices}) {
+	    $raw .= "lxc.cgroup.devices.deny = c 5:1 rwm\n";
+	} elsif (defined($cgv2)) {
+	    $raw .= "lxc.cgroup2.devices.deny = c 5:1 rwm\n";
+	}
     }
 
     my $ttycount = PVE::LXC::Config->get_tty_count($conf);
@@ -668,6 +681,15 @@ sub update_lxc_config {
 
 	my $lxcswap = int(($memory + $swap)*1024*1024);
 	$raw .= "lxc.cgroup.memory.memsw.limit_in_bytes = $lxcswap\n";
+    } elsif ($cgv2->{memory}) {
+	my $memory = $conf->{memory} || 512;
+	my $swap = $conf->{swap} // 0;
+
+	my $lxcmem = int($memory*1024*1024);
+	$raw .= "lxc.cgroup2.memory.max = $lxcmem\n";
+
+	my $lxcswap = int($swap*1024*1024);
+	$raw .= "lxc.cgroup2.memory.swap.max = $lxcswap\n";
     }
 
     if ($cgv1->{cpu}) {
@@ -679,6 +701,18 @@ sub update_lxc_config {
 
 	my $shares = $conf->{cpuunits} || 1024;
 	$raw .= "lxc.cgroup.cpu.shares = $shares\n";
+    } elsif ($cgv2->{cpu}) {
+	# See PVE::CGroup
+	if (my $cpulimit = $conf->{cpulimit}) {
+	    my $value = int(100000*$cpulimit);
+	    $raw .= "lxc.cgroup2.cpu.max = $value 100000\n";
+	}
+
+	if (defined(my $shares = $conf->{cpuunits})) {
+	    die "cpu weight (shares) must be in range [1, 10000]\n"
+		if $shares < 1 || $shares > 10000;
+	    $raw .= "lxc.cgroup2.cpu.weight = $shares\n";
+	}
     }
 
     die "missing 'rootfs' configuration\n"
@@ -1208,9 +1242,10 @@ sub template_create {
 }
 
 sub check_ct_modify_config_perm {
-    my ($rpcenv, $authuser, $vmid, $pool, $newconf, $delete) = @_;
+    my ($rpcenv, $authuser, $vmid, $pool, $oldconf, $newconf, $delete, $unprivileged) = @_;
 
     return 1 if $authuser eq 'root@pam';
+    my $storage_cfg = PVE::Storage::config();
 
     my $check = sub {
 	my ($opt, $delete) = @_;
@@ -1222,14 +1257,62 @@ sub check_ct_modify_config_perm {
 	    my $data = PVE::LXC::Config->parse_volume($opt, $newconf->{$opt});
 	    raise_perm_exc("mount point type $data->{type} is only allowed for root\@pam")
 		if $data->{type} ne 'volume';
+	    my $volid = $data->{volume};
+	    if ($volid =~ $NEW_DISK_RE) {
+		my $sid = $1;
+		$rpcenv->check($authuser, "/storage/$sid", ['Datastore.AllocateSpace']);
+	    } else {
+		PVE::Storage::check_volume_access($rpcenv, $authuser, $storage_cfg, $vmid, $volid);
+	    }
 	} elsif ($opt eq 'memory' || $opt eq 'swap') {
 	    $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Memory']);
 	} elsif ($opt =~ m/^net\d+$/ || $opt eq 'nameserver' ||
 		 $opt eq 'searchdomain' || $opt eq 'hostname') {
 	    $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Network']);
 	} elsif ($opt eq 'features') {
-	    # For now this is restricted to root@pam
-	    raise_perm_exc("changing feature flags is only allowed for root\@pam");
+	    raise_perm_exc("changing feature flags for privileged container is only allowed for root\@pam")
+		if !$unprivileged;
+
+	    my $nesting_changed = 0;
+	    my $other_changed = 0;
+	    if (!$delete) {
+		my $features = PVE::LXC::Config->parse_features($newconf->{$opt});
+		if (defined($oldconf) && $oldconf->{$opt}) {
+		    # existing container with features
+		    my $old_features = PVE::LXC::Config->parse_features($oldconf->{$opt});
+		    for my $feature ((keys %$old_features, keys %$features)) {
+			my $old = $old_features->{$feature} // '';
+			my $new = $features->{$feature} // '';
+			if ($old ne $new) {
+			    if ($feature eq 'nesting') {
+				$nesting_changed = 1;
+				next;
+			    } else {
+				$other_changed = 1;
+				last;
+			    }
+			}
+		    }
+		} else {
+		    # new container or no features defined
+		    if (scalar(keys %$features) == 1 && $features->{nesting}) {
+			$nesting_changed = 1;
+		    } elsif (scalar(keys %$features) > 0) {
+			$other_changed = 1;
+		    }
+		}
+	    } else {
+		my $features = PVE::LXC::Config->parse_features($oldconf->{$opt});
+		if (scalar(keys %$features) == 1 && $features->{nesting}) {
+		    $nesting_changed = 1;
+		} elsif (scalar(keys %$features) > 0) {
+		    $other_changed = 1;
+		}
+	    }
+	    raise_perm_exc("changing feature flags (except nesting) is only allowed for root\@pam")
+		if $other_changed;
+	    $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Allocate'])
+		if $nesting_changed;
 	} elsif ($opt eq 'hookscript') {
 	    # For now this is restricted to root@pam
 	    raise_perm_exc("changing the hookscript is only allowed for root\@pam");
@@ -1682,15 +1765,16 @@ sub __mountpoint_mount {
 		}
 	    };
 	    my $use_loopdev = 0;
-	    if ($scfg->{path}) {
-		$mounted_dev = run_with_loopdev($domount, $path, $readonly);
-		$use_loopdev = 1;
-	    } elsif ($scfg->{type} eq 'drbd' || $scfg->{type} eq 'lvm' ||
-		     $scfg->{type} eq 'rbd' || $scfg->{type} eq 'lvmthin') {
-		$mounted_dev = $path;
-		&$domount($path);
+	    if ($scfg->{content}->{rootdir}) {
+		if ($scfg->{path}) {
+		    $mounted_dev = run_with_loopdev($domount, $path, $readonly);
+		    $use_loopdev = 1;
+		} else {
+		    $mounted_dev = $path;
+		    &$domount($path);
+		}
 	    } else {
-		die "unsupported storage type '$scfg->{type}'\n";
+		die "storage '$storage' does not support containers\n";
 	    }
 	    return wantarray ? ($path, $use_loopdev, $mounted_dev) : $path;
 	} else {
@@ -1871,32 +1955,22 @@ sub alloc_disk {
 
     eval {
 	my $do_format = 0;
-	if ($scfg->{type} eq 'dir' || $scfg->{type} eq 'nfs' || $scfg->{type} eq 'cifs' ) {
-	    if ($size_kb > 0) {
-		$volid = PVE::Storage::vdisk_alloc($storecfg, $storage, $vmid, 'raw',
-						   undef, $size_kb);
+	if ($scfg->{content}->{rootdir} && $scfg->{path}) {
+	    if ($size_kb > 0 && !($scfg->{type} eq 'btrfs' && $scfg->{quotas})) {
+		$volid = PVE::Storage::vdisk_alloc($storecfg, $storage, $vmid, 'raw', undef, $size_kb);
 		$do_format = 1;
 	    } else {
-		$volid = PVE::Storage::vdisk_alloc($storecfg, $storage, $vmid, 'subvol',
-						   undef, 0);
+		$volid = PVE::Storage::vdisk_alloc($storecfg, $storage, $vmid, 'subvol', undef, $size_kb);
 		$needs_chown = 1;
 	    }
 	} elsif ($scfg->{type} eq 'zfspool') {
-
-	    $volid = PVE::Storage::vdisk_alloc($storecfg, $storage, $vmid, 'subvol',
-					       undef, $size_kb);
+	    $volid = PVE::Storage::vdisk_alloc($storecfg, $storage, $vmid, 'subvol', undef, $size_kb);
 	    $needs_chown = 1;
-	} elsif ($scfg->{type} eq 'drbd' || $scfg->{type} eq 'lvm' || $scfg->{type} eq 'lvmthin') {
-
-	    $volid = PVE::Storage::vdisk_alloc($storecfg, $storage, $vmid, 'raw', undef, $size_kb);
-	    $do_format = 1;
-
-	} elsif ($scfg->{type} eq 'rbd') {
-
+	} elsif ($scfg->{content}->{rootdir}) {
 	    $volid = PVE::Storage::vdisk_alloc($storecfg, $storage, $vmid, 'raw', undef, $size_kb);
 	    $do_format = 1;
 	} else {
-	    die "unable to create containers on storage type '$scfg->{type}'\n";
+	    die "content type 'rootdir' is not available or configured on storage '$storage'\n";
 	}
 	format_disk($storecfg, $volid, $rootuid, $rootgid) if $do_format;
     };
@@ -1912,7 +1986,6 @@ sub alloc_disk {
     return ($volid, $needs_chown);
 }
 
-our $NEW_DISK_RE = qr/^([^:\s]+):(\d+(\.\d+)?)$/;
 sub create_disks {
     my ($storecfg, $vmid, $settings, $conf, $pending) = @_;
 
@@ -2217,6 +2290,22 @@ my sub print_ct_stderr_log {
 	print STDERR "$line\n";
     }
 }
+my sub print_ct_warn_log {
+    my ($vmid) = @_;
+    my $log_fn = "/run/pve/ct-$vmid.warnings";
+    my $log = eval { file_get_contents($log_fn) };
+    return if !$log;
+
+    my $rpcenv = eval { PVE::RPCEnvironment::get() };
+
+    my $warn_fn = $rpcenv ? sub { $rpcenv->warn($_[0]) } : sub { print STDERR "WARN: $_[0]\n" };
+
+    while ($log =~ /^\h*\s*(.*?)\h*$/gm) {
+	my $line = $1;
+	$warn_fn->($line);
+    }
+    unlink $log_fn or warn "could not unlink '$log_fn' - $!\n";
+}
 
 my sub monitor_state_change($$) {
     my ($monitor_socket, $vmid) = @_;
@@ -2300,6 +2389,8 @@ sub vm_start {
 
 	# if debug is requested, print the log it also when the start succeeded
 	print_ct_stderr_log($vmid) if $is_debug;
+
+	print_ct_warn_log($vmid); # always print warn log, if any
     };
     if (my $err = $@) {
 	unlink $skiplock_flag_fn;

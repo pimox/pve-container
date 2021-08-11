@@ -352,6 +352,14 @@ sub pre_start_hook {
     $self->protected_call($code);
 }
 
+sub post_clone_hook {
+    my ($self, $conf) = @_;
+
+    $self->protected_call(sub {
+	$self->{plugin}->post_clone_hook($conf);
+    });
+}
+
 sub post_create_hook {
     my ($self, $root_password, $ssh_keys) = @_;
 
@@ -411,6 +419,14 @@ sub get_ct_os_release {
     my $data = $self->protected_call($code);
 
     return &$parse_os_release($data);
+}
+
+sub unified_cgroupv2_support {
+    my ($self) = @_;
+
+    $self->protected_call(sub {
+	$self->{plugin}->unified_cgroupv2_support();
+    });
 }
 
 1;
