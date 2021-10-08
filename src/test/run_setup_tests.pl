@@ -59,6 +59,7 @@ sub run_test {
 	my @testfiles = qw(/etc/hostname
 	                   /etc/hosts
 	                   /etc/inittab
+	                   /etc/locale.conf
 	                   /etc/network/interfaces
 	                   /etc/resolv.conf
 	                   /etc/passwd
@@ -116,6 +117,14 @@ $cluster_module->mock(
     },
     cfs_lock_file => sub {
 	die "illegal access to pmxcfs in test!\n";
+    },
+);
+
+
+my $uuid_module = Test::MockModule->new("UUID");
+$uuid_module->mock(
+    uuid => sub {
+	return '00000000-0000-0000-0000-000000000000';
     },
 );
 

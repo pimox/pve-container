@@ -17,6 +17,9 @@ use PVE::INotify;
 use PVE::Tools;
 use PVE::Network;
 
+use PVE::LXC::Setup::Plugin;
+use base qw(PVE::LXC::Setup::Plugin);
+
 sub new {
     my ($class, $conf, $rootdir, $os_release) = @_;
 
@@ -30,7 +33,8 @@ sub lookup_dns_conf {
     my $searchdomains = $conf->{searchdomain};
 
     if ($conf->{'testmode'}) {
-	return ('proxmox.com', '8.8.8.8 8.8.8.9');
+	$nameserver //= '8.8.8.8 8.8.8.9';
+	$searchdomains //= 'proxmox.com';
     }
 
     my $host_resolv_conf = $self->{host_resolv_conf};
@@ -465,12 +469,18 @@ sub set_timezone {
 	$tz_path = $self->{host_localtime};
     }
 
-    return if abs_path('/etc/localtime') eq $tz_path;
-
     if ($self->ct_file_exists($tz_path)) {
-	my $tmpfile = "localtime.$$.new.tmpfile";
-	$self->ct_symlink($tz_path, $tmpfile);
-	$self->ct_rename($tmpfile, "/etc/localtime");
+	if (abs_path('/etc/localtime') ne $tz_path) {
+	    my $tmpfile = "localtime.$$.new.tmpfile";
+	    $self->ct_symlink($tz_path, $tmpfile);
+	    $self->ct_rename($tmpfile, "/etc/localtime");
+	}
+
+	# not all distributions have /etc/timezone
+	if ($self->ct_file_exists('/etc/timezone')) {
+	    my $contents = $zoneinfo eq 'host' ? $self->{host_timezone} : $zoneinfo;
+	    $self->ct_file_set_contents('/etc/timezone', "$contents\n");
+	}
     } else {
 	warn "container does not have $tz_path, timezone can not be modified\n";
     }
@@ -539,8 +549,21 @@ sub unified_cgroupv2_support {
     return 1
 }
 
+sub ssh_host_key_types_to_generate {
+    my ($self) = @_;
+
+    return {
+	rsa => 'ssh_host_rsa_key',
+	dsa => 'ssh_host_dsa_key',
+	ecdsa => 'ssh_host_ecdsa_key',
+	ed25519 => 'ssh_host_ed25519_key',
+    };
+}
+
 sub pre_start_hook {
     my ($self, $conf) = @_;
+
+    $self->ct_file_set_contents('/fastboot', ''); # skips fsck, among other things
 
     $self->setup_init($conf);
     $self->setup_network($conf);
@@ -577,6 +600,7 @@ sub post_create_hook {
 }
 
 # File access wrappers for container setup code.
+# NOTE: those are not direct part of the Plugin API (yet), avoid using them outside the child plugins
 # For user-namespace support these might need to take uid and gid maps into account.
 
 sub ct_is_file_ignored {

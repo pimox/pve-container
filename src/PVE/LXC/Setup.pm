@@ -2,39 +2,42 @@ package PVE::LXC::Setup;
 
 use strict;
 use warnings;
-use POSIX;
-use PVE::Tools;
 
+use POSIX;
 use Cwd 'abs_path';
 
-use PVE::LXC::Setup::Debian;
-use PVE::LXC::Setup::Ubuntu;
-use PVE::LXC::Setup::CentOS;
-use PVE::LXC::Setup::Fedora;
-use PVE::LXC::Setup::SUSE;
-use PVE::LXC::Setup::ArchLinux;
+use PVE::Tools;
+
 use PVE::LXC::Setup::Alpine;
-use PVE::LXC::Setup::Gentoo;
+use PVE::LXC::Setup::ArchLinux;
+use PVE::LXC::Setup::CentOS;
+use PVE::LXC::Setup::Debian;
 use PVE::LXC::Setup::Devuan;
+use PVE::LXC::Setup::Fedora;
+use PVE::LXC::Setup::Gentoo;
+use PVE::LXC::Setup::SUSE;
+use PVE::LXC::Setup::Ubuntu;
+use PVE::LXC::Setup::Unmanaged;
 
 my $plugins = {
+    alpine    => 'PVE::LXC::Setup::Alpine',
+    archlinux => 'PVE::LXC::Setup::ArchLinux',
+    centos    => 'PVE::LXC::Setup::CentOS',
     debian    => 'PVE::LXC::Setup::Debian',
     devuan    => 'PVE::LXC::Setup::Devuan',
-    ubuntu    => 'PVE::LXC::Setup::Ubuntu',
-    centos    => 'PVE::LXC::Setup::CentOS',
     fedora    => 'PVE::LXC::Setup::Fedora',
-    opensuse  => 'PVE::LXC::Setup::SUSE',
-    archlinux => 'PVE::LXC::Setup::ArchLinux',
-    alpine    => 'PVE::LXC::Setup::Alpine',
     gentoo    => 'PVE::LXC::Setup::Gentoo',
+    opensuse  => 'PVE::LXC::Setup::SUSE',
+    ubuntu    => 'PVE::LXC::Setup::Ubuntu',
+    unmanaged => 'PVE::LXC::Setup::Unmanaged',
 };
 
 # a map to allow supporting related distro flavours
 my $plugin_alias = {
-    arch => 'archlinux',
-    sles => 'opensuse',
     'opensuse-leap' => 'opensuse',
     'opensuse-tumbleweed' => 'opensuse',
+    arch => 'archlinux',
+    sles => 'opensuse',
 };
 
 my $autodetect_type = sub {
@@ -85,12 +88,12 @@ sub new {
 
     die "no root directory\n" if !$rootdir || $rootdir eq '/';
 
-    my $self = bless { conf => $conf, rootdir => $rootdir};
+    my $self = bless { conf => $conf, rootdir => $rootdir}, $class;
 
     my $os_release = $self->get_ct_os_release();
 
     if ($conf->{ostype} && $conf->{ostype} eq 'unmanaged') {
-	return $self;
+	$type = 'unmanaged';
     } elsif (!defined($type)) {
 	# try to autodetect type
 	$type = &$autodetect_type($self, $rootdir, $os_release);
@@ -103,13 +106,7 @@ sub new {
 	}
     }
 
-    if ($type eq 'unmanaged') {
-	$conf->{ostype} = $type;
-	return $self;
-    }
-
-    my $plugin_class = $plugins->{$type} ||
-	"no such OS type '$type'\n";
+    my $plugin_class = $plugins->{$type} || die "no such OS type '$type'\n";
 
     my $plugin = $plugin_class->new($conf, $rootdir, $os_release);
     $self->{plugin} = $plugin;
@@ -117,7 +114,10 @@ sub new {
 
     # Cache some host files we need access to:
     $plugin->{host_resolv_conf} = PVE::INotify::read_file('resolvconf');
-    $plugin->{host_localtime} = abs_path('/etc/localtime');
+    $plugin->{host_timezone} = PVE::INotify::read_file('timezone');
+
+    abs_path('/etc/localtime') =~ m|^(/.+)| or die "invalid /etc/localtime\n"; # untaint
+    $plugin->{host_localtime} = $1;
 
     # pass on user namespace information:
     my ($id_map, $rootuid, $rootgid) = PVE::LXC::parse_id_maps($conf);
@@ -126,7 +126,7 @@ sub new {
 	$plugin->{rootuid} = $rootuid;
 	$plugin->{rootgid} = $rootgid;
     }
-    
+
     return $self;
 }
 
@@ -174,202 +174,114 @@ sub protected_call {
 
 sub template_fixup {
     my ($self) = @_;
-
-    return if !$self->{plugin}; # unmanaged
-
-    my $code = sub {
-	$self->{plugin}->template_fixup($self->{conf});
-    };
-    $self->protected_call($code);
+    $self->protected_call(sub { $self->{plugin}->template_fixup($self->{conf}) });
 }
- 
+
 sub setup_network {
     my ($self) = @_;
-
-    return if !$self->{plugin}; # unmanaged
-
-    my $code = sub {
-	$self->{plugin}->setup_network($self->{conf});
-    };
-    $self->protected_call($code);
+    $self->protected_call(sub { $self->{plugin}->setup_network($self->{conf}) });
 }
 
 sub set_hostname {
     my ($self) = @_;
-
-    return if !$self->{plugin}; # unmanaged
-
-    my $code = sub {
-	$self->{plugin}->set_hostname($self->{conf});
-    };
-    $self->protected_call($code);
+    $self->protected_call(sub { $self->{plugin}->set_hostname($self->{conf}) });
 }
 
 sub set_dns {
     my ($self) = @_;
-
-    return if !$self->{plugin}; # unmanaged
-
-    my $code = sub {
-	$self->{plugin}->set_dns($self->{conf});
-    };
-    $self->protected_call($code);
+    $self->protected_call(sub { $self->{plugin}->set_dns($self->{conf}) });
 }
 
 sub set_timezone {
     my ($self) = @_;
-
-    return if !$self->{plugin}; # unmanaged
-    my $code = sub {
-	$self->{plugin}->set_timezone($self->{conf});
-    };
-    $self->protected_call($code);
+    $self->protected_call(sub { $self->{plugin}->set_timezone($self->{conf}) });
 }
 
 sub setup_init {
     my ($self) = @_;
-
-    return if !$self->{plugin}; # unmanaged
-
-    my $code = sub {
-	$self->{plugin}->setup_init($self->{conf});
-    };
-    $self->protected_call($code);
+    $self->protected_call(sub { $self->{plugin}->setup_init($self->{conf}) });
 }
 
 sub set_user_password {
     my ($self, $user, $pw) = @_;
+    $self->protected_call(sub { $self->{plugin}->set_user_password($self->{conf}, $user, $pw) });
+}
 
-    return if !$self->{plugin}; # unmanaged
+my sub generate_ssh_key { # create temporary key in hosts' /run, then read and unlink
+    my ($type, $comment) = @_;
 
-    my $code = sub {
-	$self->{plugin}->set_user_password($self->{conf}, $user, $pw);
+    my $key_id = '';
+    my $keygen_outfunc = sub {
+	if ($_[0] =~ m/^((?:[0-9a-f]{2}:)+[0-9a-f]{2}|SHA256:[0-9a-z+\/]{43})\s+\Q$comment\E$/i) {
+	    $key_id = $_[0];
+	}
     };
-    $self->protected_call($code);
+    my $file = "/run/pve/.tmp$$.$type";
+    PVE::Tools::run_command(
+	['ssh-keygen', '-f', $file, '-t', $type, '-N', '', '-E', 'sha256', '-C', $comment],
+	outfunc => $keygen_outfunc,
+    );
+    my ($private) = (PVE::Tools::file_get_contents($file) =~ /^(.*)$/sg); # untaint
+    my ($public) = (PVE::Tools::file_get_contents("$file.pub") =~ /^(.*)$/sg); # untaint
+    unlink $file, "$file.pub";
+
+    return ($key_id, $private, $public);
 }
 
 sub rewrite_ssh_host_keys {
     my ($self) = @_;
 
-    return if !$self->{plugin}; # unmanaged
-
-    my $conf = $self->{conf};
     my $plugin = $self->{plugin};
-    my $rootdir = $self->{rootdir};
 
-    return if ! -d "$rootdir/etc/ssh";
+    my $keynames = $plugin->ssh_host_key_types_to_generate();
 
-    my $keynames = {
-	rsa => 'ssh_host_rsa_key',
-	dsa => 'ssh_host_dsa_key',
-	ecdsa => 'ssh_host_ecdsa_key', 
-	ed25519 => 'ssh_host_ed25519_key',
-    };
+    return if ! -d "$self->{rootdir}/etc/ssh" || !$keynames || !scalar(keys $keynames->%*);
 
-    my $hostname = $conf->{hostname} || 'localhost';
+    my $hostname = $self->{conf}->{hostname} || 'localhost';
     $hostname =~ s/\..*$//;
-    my $ssh_comment = "root\@$hostname";
 
-    my $keygen_outfunc = sub {
-	my $line = shift;
-
-	print "done: $line\n"
-	    if $line =~ m/^(?:[0-9a-f]{2}:)+[0-9a-f]{2}\s+\Q$ssh_comment\E$/i ||
-	       $line =~ m/^SHA256:[0-9a-z+\/]{43}\s+\Q$ssh_comment\E$/i;
-    };
-
-    # Create temporary keys in /tmp on the host
-    my $keyfiles = {};
-    foreach my $keytype (keys %$keynames) {
+    my $keyfiles = [];
+    for my $keytype (keys $keynames->%*) {
 	my $basename = $keynames->{$keytype};
-	my $file = "/tmp/$$.$basename";
 	print "Creating SSH host key '$basename' - this may take some time ...\n";
-	my $cmd = ['ssh-keygen', '-f', $file, '-t', $keytype,
-		   '-N', '', '-E', 'sha256', '-C', $ssh_comment];
-	PVE::Tools::run_command($cmd, outfunc => $keygen_outfunc);
-	$keyfiles->{"/etc/ssh/$basename"} = [PVE::Tools::file_get_contents($file), 0600];
-	$keyfiles->{"/etc/ssh/$basename.pub"} = [PVE::Tools::file_get_contents("$file.pub"), 0644];
-	unlink $file;
-	unlink "$file.pub";
+	my ($id, $private, $public) = generate_ssh_key($keytype, "root\@$hostname");
+	print "done: $id\n";
+
+	push $keyfiles->@*, ["/etc/ssh/$basename", $private, 0600], ["/etc/ssh/$basename.pub", $public, 0644];
     }
 
-    # Write keys out in a protected call
-
-    my $code = sub {
-	foreach my $file (keys %$keyfiles) {
-	    $plugin->ct_file_set_contents($file, @{$keyfiles->{$file}});
+    $self->protected_call(sub { # write them now all to the CTs rootfs at once
+	for my $file ($keyfiles->@*) {
+	    $plugin->ct_file_set_contents($file->@*);
 	}
-    };
-    $self->protected_call($code);
-}    
-
-my $container_emulator_path = {
-    'amd64' => '/usr/bin/qemu-x86_64-static',
-    'arm64' => '/usr/bin/qemu-aarch64-static',
-};
+    });
+}
 
 sub pre_start_hook {
     my ($self) = @_;
 
-    return if !$self->{plugin}; # unmanaged
-
-    my $host_arch = PVE::Tools::get_host_arch();
-
-    # containers use different architecture names
-    if ($host_arch eq 'x86_64') {
-	$host_arch = 'amd64';
-    } elsif ($host_arch eq 'aarch64') {
-	$host_arch = 'arm64';
-    } else {
-	die "unsupported host architecture '$host_arch'\n";
-    }
-
-    my $container_arch = $self->{conf}->{arch};
-
-    $container_arch = 'amd64' if $container_arch eq 'i386'; # always use 64 bit version
-    $container_arch = 'arm64' if $container_arch eq 'armhf'; # always use 64 bit version
-
-    my $emul;
-    my $emul_data;
-
-    if ($host_arch ne $container_arch) {
-	if ($emul = $container_emulator_path->{$container_arch}) {
-	    $emul_data = PVE::Tools::file_get_contents($emul, 10*1024*1024) if -f $emul;
-	}
-    }
-
-    my $code = sub {
-
-	if ($emul && $emul_data) {
-	    $self->{plugin}->ct_file_set_contents($emul, $emul_data, 0755);
-	}
-
-	# Create /fastboot to skip run fsck
-	$self->{plugin}->ct_file_set_contents('/fastboot', '');
-
-	$self->{plugin}->pre_start_hook($self->{conf});
-    };
-    $self->protected_call($code);
+    $self->protected_call(sub { $self->{plugin}->pre_start_hook($self->{conf}) });
 }
 
 sub post_clone_hook {
     my ($self, $conf) = @_;
 
-    $self->protected_call(sub {
-	$self->{plugin}->post_clone_hook($conf);
-    });
+    $self->protected_call(sub { $self->{plugin}->post_clone_hook($conf) });
 }
 
 sub post_create_hook {
     my ($self, $root_password, $ssh_keys) = @_;
 
-    return if !$self->{plugin}; # unmanaged
-
-    my $code = sub {
+    $self->protected_call(sub {
 	$self->{plugin}->post_create_hook($self->{conf}, $root_password, $ssh_keys);
-    };
-    $self->protected_call($code);
+    });
     $self->rewrite_ssh_host_keys();
+}
+
+sub unified_cgroupv2_support {
+    my ($self) = @_;
+
+    return $self->protected_call(sub { $self->{plugin}->unified_cgroupv2_support() });
 }
 
 # os-release(5):
@@ -407,26 +319,16 @@ my $parse_os_release = sub {
 sub get_ct_os_release {
     my ($self) = @_;
 
-    my $code = sub {
+    my $data = $self->protected_call(sub {
 	if (-f '/etc/os-release') {
 	    return PVE::Tools::file_get_contents('/etc/os-release');
 	} elsif (-f '/usr/lib/os-release') {
 	    return PVE::Tools::file_get_contents('/usr/lib/os-release');
 	}
 	return undef;
-    };
-
-    my $data = $self->protected_call($code);
+    });
 
     return &$parse_os_release($data);
-}
-
-sub unified_cgroupv2_support {
-    my ($self) = @_;
-
-    $self->protected_call(sub {
-	$self->{plugin}->unified_cgroupv2_support();
-    });
 }
 
 1;

@@ -3,6 +3,8 @@ package PVE::LXC::Setup::CentOS;
 use strict;
 use warnings;
 
+use UUID;
+
 use PVE::Tools;
 use PVE::Network;
 use PVE::LXC;
@@ -110,6 +112,11 @@ sub template_fixup {
 	$data =~ s!^(/sbin/start_udev.*)$!#$1!gm;
 	$self->ct_file_set_contents($filename, $data);
     }
+
+    # temporary fix for systemd-firstboot as else it prompts for this option on a unconnected tty forever,
+    # making it seem like the CT hangs
+    $self->ct_file_set_contents('/etc/locale.conf', "LANG=C.utf8") if !$self->ct_file_exists('/etc/locale.conf');
+
     # always call so root can login, if /etc/securetty doesn't exists it's a no-op
     $self->setup_securetty($conf);
 }
@@ -185,7 +192,7 @@ sub setup_network {
 	my $routes = '';
 	my $routes6 = '';
 
-	my $header = "DEVICE=$d->{name}\nONBOOT=yes\n";
+	my $header = "DEVICE=$d->{name}\nONBOOT=yes\nUUID=" . UUID::uuid() ."\n";
 	my $data = '';
 	my $bootproto = '';
 
@@ -212,14 +219,14 @@ sub setup_network {
 	    $data .= "IPV6INIT=yes\n";
 	    if ($d->{ip6} eq 'auto') {
 		$data .= "IPV6_AUTOCONF=yes\n";
-	    }
-	    if ($d->{ip6} eq 'dhcp') {
+	    } elsif ($d->{ip6} eq 'dhcp') {
 		$data .= "DHCPV6C=yes\n";
 	    } else {
 		$data .= "IPV6ADDR=$d->{ip6}\n";
 		if (defined($d->{gw6})) {
 		    if (!PVE::Network::is_ip_in_cidr($d->{gw6}, $d->{ip6}, 6) &&
-			!PVE::Network::is_ip_in_cidr($d->{gw6}, 'fe80::/10', 6)) {
+			!PVE::Network::is_ip_in_cidr($d->{gw6}, 'fe80::/10', 6)
+		    ) {
 			$routes6 .= "$d->{gw6} dev $d->{name}\n";
 			$routes6 .= "default via $d->{gw6} dev $d->{name}\n";
 		    } else {
@@ -228,6 +235,14 @@ sub setup_network {
 		}
 	    }
 	}
+
+	my ($searchdomains, $nameserver) = $self->lookup_dns_conf($conf);
+	my @nameservers = PVE::Tools::split_list($nameserver);
+
+	for my $i (0 .. $#nameservers) {
+	    $data .= "DNS".($i+1)."=$nameservers[$i]\n";
+	}
+	$data .= "DOMAIN=".join(' ', PVE::Tools::split_list($searchdomains))."\n" if $searchdomains;
 
 	next unless $data || $bootproto;
 	$header .= "BOOTPROTO=$bootproto\n";
